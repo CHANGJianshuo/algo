@@ -2,4 +2,4 @@
 
 Academic Track. Single unified Recommendation Block for sequence modeling and multi-field feature interaction. Goal: pCVR prediction (AUC ranking).
 
-See plan: `~/.claude/plans/https-algo-qq-com-magical-kahan.md`
+See plan: [PLAN.md](./PLAN.md)
