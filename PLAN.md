@@ -285,3 +285,182 @@ taac2026/
 - DIN/SIM: 阿里目标注意力序列建模经典
 - "Ads Recommendation in a Collapsed and Entangled World": arxiv 2403.00793
 - FlashAttention-2: Tri Dao
+
+---
+
+# 十一、精调复审 — 潜在 bug、加固点与差异化收紧
+
+针对 5 个核心问题做一次"红队"式复审。**这是对前面方案的修正层,实施时若有冲突以本节为准。**
+
+## 11.1 HSTU + KV-Aware Token Fusion 的潜在 bug
+
+### Bug 1:KV token 数爆炸
+- 8 个对齐字段(`user_int_feats_{62-66, 89-91}`),每条样本中数组长度可达 N=数十到数百
+- 若每个 KV 对独立成 token,8 字段 × 平均 50 = **400 token**,叠加 4×128 序列 + 50 标量 = 总 token >1000
+- **后果**:O(L²) attention 显存×4,延迟×4,直接超 budget
+
+**修正**:KV 字段不展平成多 token,而用**字段内 attention pool**:
+```
+keys = embed(int_arr)            # [N, d]
+vals = linear(dense_arr)         # [N, d]
+gates = sigmoid(W_g · vals)      # [N, 1]
+field_token = sum(keys * gates) / max(sum(gates), 1e-6)   # [d]
+```
+每字段产出 1 个 token,8 字段 → 8 token。这同时是创新点(不是简单 mean pool,是 value-driven gated pool)。
+
+### Bug 2:数组型 user int feats(`{15, 60, 62-66, 80, 89-91}`)长度不齐
+- 11 个 array 字段,每条样本长度不同
+- 若用 padding 到 max_len 会浪费,用 ragged tensor 又难配 FlashAttention
+
+**修正**:
+- 字段 62-66, 89-91 走 11.1 的 attention pool(已解决)
+- 字段 15, 60, 80 单独做 multi-hot embedding pooling(mean + max + attention 三路 concat)
+- 长度 P95 截断,P95 通常远小于 max,显存压力小
+
+### Bug 3:type embedding 与位置 embedding 冲突
+- 序列 token 需要相对时间编码(`Δt = label_time - event_time` 分桶)
+- 非序列 token 没有时间概念,直接给 `Δt=0` 会让 attention 误以为它们都是"刚刚"
+- **修正**:为非序列 token 用单独的 type-positional encoding,与序列 token 的时间编码使用**正交子空间**(各占 d/2 维)
+
+### Bug 4:FlashAttention 与异构 mask 不兼容
+- HSTU 主要在序列 token 间走 attention
+- 非序列 token 是否参与 self-attention?若全部参与 → mask 矩阵复杂,FA 加速有限
+- **修正**:采用**两段式架构**
+  1. 第一段(N₁ 层):非序列 token + 4 域序列各自做局部 attention(可并行,FA 友好)
+  2. 第二段(N₂ 层):全 token 做 fused attention(此处 token 数已被 11.1 压缩到 ≤300,可走 FA)
+
+### Bug 5:embedding vocab 共享 vs 独立
+- 4 域序列若共享 item embedding,假设了"item 在不同域行为语义一致"
+- 若不同域是 e.g. {电商点击, 视频观看, 广告展示, 搜索} —— 同一 item_id 在不同域的语义可能不同
+- **修正**:**共享主表 + 域 adapter**:`emb_d = emb_shared + W_d · emb_shared`,W_d 是低秩矩阵(rank=8),既共享又区分
+
+## 11.2 Domain-Routed Gated HSTU 的创新性是否够拿 Unified Block Award
+
+### 诚实评估
+| 已有工作 | 与本方案重叠点 |
+|---|---|
+| HSTU 本身 | 已声称统一序列与特征,GLU 同时做两件事 |
+| MoE / Switch Transformer | 路由门控不算新 |
+| PEPNet (KuaiShou) | 个性化门控网络,已用于 CTR |
+| HiNet (KuaiShou) | 多场景门控 |
+| FuxiCTR | 多模块组合的统一框架 |
+
+**结论**:仅仅"按 token 类型路由 sequence-path/feature-path"创新性中等,容易被审稿质疑成 PEPNet + HSTU 拼接。
+
+### 加强差异化(三选一,推荐 ①②叠加)
+
+**① Recency-Aware Routing(基于时间的动态路由)**
+- 路由 gate 不止依赖 token type,还依赖 token 的"新鲜度"
+- 直觉:近期行为走 sequence path(强调时序),远期/聚合特征走 feature-cross path(强调统计交叉)
+- 公式:`gate = softmax(W·[type_emb, log(1+Δt)_bucket_emb, content_emb])`
+
+**② Cross-Path Bilinear Mixing(路径间显式二阶交互)**
+- 不仅仅加权和,引入路径间的 bilinear:`out = α·seq + β·cross + γ·(seq ⊙ W_mix · cross)`
+- 第三项让两条路径的输出**显式相乘**,符合"特征交叉"的几何直觉
+- 这一项是真正的原创点,暂未在公开文献找到完全相同形式
+
+**③ Routing Sparsity Regularizer**
+- 加 L0/Gini 正则鼓励 gate 在不同 token 上呈现差异化分布
+- 防止 gate 退化成"所有 token 都走同一路径"
+- 这一项让你在 ablation 表上能展示"gate 学到了什么"——可视化超 sell
+
+### 关于 Scaling Law 创新奖
+原计划 4 维 sweep(params, seq_len, embed_dim, train_tokens)是**够的最低配**。建议补一维:
+- **路由稀疏度 vs 模型大小**:在不同模型规模下,gate 倾向是否变化?这是把 routing 创新与 scaling 绑定的关键实验,直接服务两个奖项。
+
+## 11.3 9 周排期的现实性
+
+### 风险点逐周
+| 周 | 风险 | 调整 |
+|---|---|---|
+| **W1** | "环境+数据+EDA+Latency Harness+Baseline+首次提交"6 件事 7 天太满 | 拆:**W0**(数据下载+环境+repo 骨架,1 天) + W1 仅做 EDA+Latency Harness+最简 baseline,**首次提交推到 W2 周一** |
+| W2 | KV-Aware Fusion 涉及自定义算子,debug 耗时 | 预留 1 天 debug buffer,削减目标到 ≥1.0pt 提升(原 1.5pt) |
+| W3 | HSTU 主干替换,与 W2 改动叠加 | 必须在 W2 末有清晰 commit hash 作 baseline,W3 只改主干一处 |
+| W4 | 创新模块涉及训练稳定性问题 | 先验证 ① Recency Routing 单独效果,**②③ 留到 W5** |
+| W5 | 辅助损失消融 4 项 × 至少 2 配置 = 8 次训练 | 8 卡可并行 8 次,1 天内完成,但需在 W4 末固化训练流水 |
+| **W6** | Scaling Law 50 次训练 | **8 卡并行 → 50/8 ≈ 7 批 × 4-6h = 28-48h**,2 天足够;但需独立测试集,不能动 valid |
+| W7 | 调参容易过拟合 valid | 用 holdout(留出的 5%)只看一次,不参与超参选择 |
+| W8 | 量化精度损失可能 ≥0.005 AUC | 提前在 W6 验证 INT8 精度;若不达标,提前训蒸馏 student |
+| **W9** | 报告压缩到最后一周 | **报告写作并行启动于 W6**,W9 只做润色与图表 |
+
+### 关键漏掉的 milestone
+1. **LB 提交节奏管理**:多数比赛每日提交受限(典型 5 次/天)。需为每周预留至少 2 次"诊断性"提交(对照实验需配对提交)
+2. **数据回归测试**:每次 data pipeline 改动后必须跑回归 — 否则 W4 之后的提升可能源于数据 bug
+3. **复现性 freeze 点**:W7 末必须有可一键复现的 commit;W8 只允许 inference-side 改动
+4. **官方推理协议适配**:估计 1-3 天工作量,需提前确认是 PyTorch/ONNX/TVM 何种格式,**放进 W6**
+
+## 11.4 防泄漏 / 防过拟合 加固
+
+### 已覆盖 → 已加固
+| 项 | 加固动作 |
+|---|---|
+| 时间切分 | 增加:确认 `timestamp` 与 `label_time` 单位(看示例值约 1.77e9 → 秒级 Unix);若不一致需统一 |
+| 序列泄漏 | 增加:对每条样本检查 max(seq_timestamps) < label_time,违反样本直接抛错 |
+| Vocab 泄漏 | 增加:vocab 只用 train 统计;valid/test 中未见 ID 全部 → OOV bucket |
+
+### 新增必做
+1. **预训练 embedding 时间穿越检查**
+   - `user_dense_feats_61` (SUM) 和 `user_dense_feats_87` (LMF4Ads) 是预训练得到的
+   - 若 SUM/LMF4Ads 训练数据时间窗 ≥ 你的 valid 时间,等于变相泄漏
+   - **动作**:在 W2 写一份 ablation,关掉这两个 dense feature 后 AUC 下降幅度若 >5pt,就要警惕
+2. **Adversarial Validation(分布漂移诊断)**
+   - 训一个二分类:train→0, valid→1
+   - 若 AUC > 0.6,说明 train/valid 分布差异大,需用其结果做 sample weighting 让 train 接近 valid
+3. **Cold User / Cold Item 不剔除**
+   - valid 中只在 valid 出现的 user/item 是真实测试场景,保留并报告冷启动 AUC 单独数值
+4. **Embedding-level Mixup 风险**
+   - 计划提到 α=0.1 的 embedding Mixup;但 ID 类 embedding 做 Mixup 在语义上是错的(ID 之间没线性空间)
+   - **修正**:Mixup 仅作用于 **dense feature** 与 **池化后的序列表征**,不作用于 ID embedding
+5. **正负比与 Focal Loss**
+   - CVR 任务正样本通常 <5%;若用纯 BCE,模型偏向预测多数类
+   - **加备选**:`focal_loss(γ=1.5)` 与 `class_balanced_BCE`,在 W5 与 BCE 做 A/B
+6. **EMA 选择策略**
+   - 不要只用 EMA 模型评估,**同时记录原始权重 valid AUC**,选两者中较高者作为最终模型(保留快照,不算 ensemble)
+
+### 减少过拟合
+- 1M 样本 / 100M 参数 ≈ 10:1 token-to-param ratio,远低于 Chinchilla 最优 20:1
+- **结论**:不要无脑追求 200M 参数,Scaling Law 实验大概率会显示 60-100M 是甜点
+- 若希望大模型涨点,只能靠**预训练**(用 LMF4Ads 蒸馏 + 自监督序列预训练),而非纯监督扩参
+
+## 11.5 与 SOTA 的差异化定位收紧
+
+### 诚实对照表
+| 工作 | 创新点 | 本方案差异 |
+|---|---|---|
+| **HSTU** (Meta) | GLU 替代 softmax,序列推荐 scaling | 我们**借用** HSTU 作主干,不能声称是创新 |
+| **TIGER** | 语义 ID + 生成式预测下一个 item | 完全不同范式,我们是判别式 CTR/CVR 头 |
+| **DCN-V2** | bit-wise cross,纯特征交互 | 我们集成此思路到 feature-cross path,引用而非创新 |
+| **PEPNet/HiNet** (Kuai) | 个性化/多场景 gating | 我们 routing 维度更细(per-token 而非 per-sample) |
+| **FuxiCTR** | CTR 模块化框架 | 我们是 unified block,非框架 |
+| **PinnerFormer / SASRec** | 序列推荐主干 | 不处理多字段特征交叉 |
+
+### 真正的差异点(写论文时强调这三条)
+
+1. **Per-Token Routing within a Single Block**
+   - PEPNet/HiNet 的 gating 在 sample 或 task 级
+   - 本方案在 token 级,且是同一 block 内 sequence-path / feature-path 的路由
+   - 这是 MoE 的 token-level 形式,但 expert 不是 FFN 而是**两条结构性不同的算子路径**
+
+2. **KV-Aware Field Tokenization**
+   - 现有工作几乎都把 dense feature 当独立标量 concat
+   - 本方案显式建模 `(int_id, dense_value)` 的 key-value 对齐结构,用 value-driven gated pool
+   - 这一点在 ablation 中应能呈现 ≥1pt AUC,**写论文时单列一节**
+
+3. **Routing Sparsity ↔ Scaling Law**
+   - 大多数 unified 工作不研究 routing 决策如何随规模演变
+   - 本方案在 4 维 sweep 之外加 routing entropy 维度,呈现**模型变大时门控如何变稀疏/专门化**
+   - 这把 Unified Block 与 Scaling Law 两个奖项绑定,论文卖点统一
+
+### 不应声称的差异化(避免审稿被打)
+- ❌ "首个统一 block":HSTU 已在做
+- ❌ "首次跨域统一":CDR 领域工作多
+- ❌ "解决 collapsed and entangled":Pan 等 2024 已用此 framing
+- ❌ "比 ensemble 更好":赛规禁止 ensemble,无可对比
+
+---
+
+## 11.6 立即更新到执行排期的两条结论
+
+1. **W0 增加为独立准备周**(数据/环境/repo/账户认证/官方推理格式调研)
+2. **创新模块拆三步推进**:Routing(W4) → Cross-Path Bilinear(W5) → Routing Sparsity Regularizer(W5 末),分阶段固化能跑出更可信的 ablation 表
+
