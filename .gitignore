@@ -1,0 +1,22 @@
+# Demo/test data — too large for git, may have license restrictions
+demo_*.parquet
+demo_*.xlsx
+*.parquet:Zone.Identifier
+
+# Windows browser download metadata
+*:Zone.Identifier
+
+# Python artefacts
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local-only utility scripts (kept on disk, not synced)
+parquet_to_excel.py
+parquet_to_excel_full.py
