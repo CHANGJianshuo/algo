@@ -64,4 +64,4 @@ DCN 层数:2(默认)。1024 维 × 2 层 ≈ 2M dense 参数,相比 2.37 亿 emb
 
 ## 提交
 
-Job Name `millow_5`。上传 train/ 9 个文件 + evaluation/ 3 个文件。`run.sh` 已配好。
+Job Name `millow_5`。上传 train/ 8 个文件 + evaluation/ 3 个文件。`run.sh` 已配好。

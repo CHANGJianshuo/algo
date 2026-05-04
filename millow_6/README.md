@@ -67,4 +67,4 @@ for each KV pair (8 总):
 
 ## 提交
 
-Job Name `millow_6`。上传 train/ 9 个文件 + evaluation/ 3 个文件。run.sh 已配好。
+Job Name `millow_6`。上传 train/ 8 个文件 + evaluation/ 3 个文件。run.sh 已配好。

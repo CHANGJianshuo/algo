@@ -65,10 +65,9 @@ millow_4/
 ├── README.md          ← 本文档
 ├── ARCHITECTURE.md    ← 模型结构详解
 ├── DEVLOG.md          ← 开发记录
-├── train/             ← 训练代码包(上传 Model Training)
+├── train/             ← 训练代码包(上传 Model Training,8 文件)
 │   ├── dataset.py     主办方原版
-│   ├── ema.py         W1 EMA 类
-│   ├── latency_harness.py  W1 后训练延迟测量
+│   ├── ema.py         W1 EMA 类(被 trainer.py import,必须保留)
 │   ├── model.py       **改动**: KVAware sum-pool 版
 │   ├── ns_groups.json 主办方原版
 │   ├── run.sh         **改动**: W3 配置
@@ -83,7 +82,7 @@ millow_4/
 
 ## 提交
 
-1. 平台 Model Training:Job Name `millow_4`,上传 train/ 下 9 个文件,run.sh 已配好,直接 Submit
+1. 平台 Model Training:Job Name `millow_4`,上传 train/ 下 8 个文件,run.sh 已配好,直接 Submit
 2. Resources = 1
 3. 训完后 Model Evaluation:上传 evaluation/ 下 3 个文件,选 millow_4 的 model
 
