@@ -225,6 +225,14 @@ def parse_args() -> argparse.Namespace:
                         help='Include NS tokens (static user/item profile) alongside the per-seq '
                              'query tokens in the final classifier. Expands output_proj input dim. '
                              'Not backward-compatible with checkpoints trained without this flag.')
+    # millow_4 does NOT use DCN — these flags are accepted (and ignored)
+    # only so a run.sh that leaks from millow_5 won't crash with
+    # "unrecognized arguments" on the platform. They're never forwarded
+    # to model_args, so millow_4's model is unaffected.
+    parser.add_argument('--use_dcn', action='store_true', default=False,
+                        help='[ignored in millow_4] DCN-V2 flag — only used in millow_5')
+    parser.add_argument('--dcn_layers', type=int, default=2,
+                        help='[ignored in millow_4] DCN layer count — only used in millow_5')
     parser.add_argument('--measure_latency', action='store_true', default=True,
                         help='Measure single-request inference latency at the end of training '
                              '(default on; required for the hard latency cap budget).')
