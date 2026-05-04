@@ -342,8 +342,14 @@ def main() -> None:
     seq_max_lens = _parse_seq_max_lens(sml_str)
     logging.info(f"seq_max_lens: {seq_max_lens}")
 
-    # ---- Data loading: reuse batch_size / num_workers from training config ----
-    batch_size = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
+    # ---- Data loading: cap batch_size aggressively for evaluation. The
+    # vGPU at eval time runs the same model as training but ckpt is
+    # double-loaded (CPU -> GPU) and tightens free memory. Using train
+    # batch_size=128 reliably OOMs; clamp to 16 to keep ample headroom.
+    train_bs = int(train_config.get('batch_size', _FALLBACK_BATCH_SIZE))
+    batch_size = min(16, train_bs)
+    if batch_size != train_bs:
+        logging.info(f"Eval batch_size capped to {batch_size} (train was {train_bs}) to avoid OOM")
     num_workers = int(train_config.get('num_workers', _FALLBACK_NUM_WORKERS))
 
     test_dataset = PCVRParquetDataset(
@@ -407,13 +413,24 @@ def main() -> None:
     all_user_ids = []
     logging.info("Starting inference...")
 
+    # bf16 autocast halves activation memory at negligible accuracy cost
+    # for inference; safe on A100/H100 vGPUs which all support bf16.
+    use_bf16 = torch.cuda.is_available() and 'cuda' in str(device)
+
+    import contextlib
+    def _autocast_ctx():
+        if use_bf16:
+            return torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        return contextlib.nullcontext()
+
     with torch.no_grad():
         for batch_idx, batch in enumerate(test_loader):
             model_input = _batch_to_model_input(batch, device)
             user_ids = batch.get('user_id', [])
 
-            logits, _ = model.predict(model_input)
-            logits = logits.squeeze(-1)
+            with _autocast_ctx():
+                logits, _ = model.predict(model_input)
+            logits = logits.float().squeeze(-1)
             probs = torch.sigmoid(logits).cpu().numpy()
             all_probs.extend(probs.tolist())
             all_user_ids.extend(user_ids)
